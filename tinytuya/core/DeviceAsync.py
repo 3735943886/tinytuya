@@ -108,16 +108,8 @@ class DeviceAsync(object):
         self.real_local_key = self.local_key
         self.auto_key = not local_key
         self.version = version
-        #self._callback_queue = asyncio.Queue()
-        self._callbacks_connect = []
-        self._callbacks_disconnect = []
-        self._callbacks_response = []
-        self._deferred_callbacks = []
-        self._deferred_task = None
-        self._deferred_task_running = False
         self._send_lock = asyncio.Lock()
         self._recv_lock = asyncio.Lock()
-        self._rcv2_lock = asyncio.Lock()
         self._conn_lock = asyncio.Lock()
         self.connected = asyncio.Event()
         self._close_task = None
@@ -147,46 +139,6 @@ class DeviceAsync(object):
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self._close()
-
-    async def _defer_callbacks(self, delay=True, pause=False):
-        if self._deferred_task and not self._deferred_task_running:
-            if (not (delay or pause)) or self._deferred_task.done():
-                deferred = self._deferred_task
-                self._deferred_task = None
-                print('cancelling CB task')
-                deferred.cancel()
-                await deferred
-                print('CB task cancelled')
-        if self._deferred_callbacks and (not self._deferred_task) and (not pause):
-            if delay:
-                print('deferring cb for 100ms', len(self._deferred_callbacks))
-                self._deferred_task = asyncio.create_task( self._run_deferred_callbacks_later() )
-            else:
-                print('scheduling cb immediately', len(self._deferred_callbacks))
-                # run immediate task doe snto support cancelling, so mark as running
-                self._deferred_task_running = True
-                self._deferred_task = asyncio.create_task( self._run_deferred_callbacks() )
-
-    async def _run_deferred_callbacks(self):
-        self._deferred_task_running = True
-        print('running CBs')
-        cbs = self._deferred_callbacks
-        self._deferred_callbacks = []
-        for cb in cbs:
-            await cb
-        if self._deferred_callbacks:
-            print('running CBs again')
-            await self._run_deferred_callbacks()
-        print('CBs finished')
-        self._deferred_task_running = False
-
-    async def _run_deferred_callbacks_later(self):
-        try:
-            await asyncio.sleep(0.1)
-        except asyncio.CancelledError:
-            return
-        self._deferred_task_running = True
-        await self._run_deferred_callbacks()
 
     async def _load_child_cids( self ):
         self._auto_cid_children = False
@@ -297,10 +249,6 @@ class DeviceAsync(object):
             if self.auto_ip:
                 self.address = None
 
-        for cb in self._callbacks_connect:
-            self._deferred_callbacks.append( cb( self, err ) )
-        await self._defer_callbacks()
-
         if err:
             self.connected.clear()
         else:
@@ -328,8 +276,7 @@ class DeviceAsync(object):
         # make sure to use the parent's self.seqno and session key
         if self.parent:
             return await self.parent._receive(timeout)
-        async with self._rcv2_lock:
-            return await self._receive_locked( timeout )
+        return await self._receive_locked( timeout )
 
     async def _receive_locked(self, timeout):
         # message consists of header + retcode + [data] + crc (4 or 32) + footer
@@ -447,17 +394,13 @@ class DeviceAsync(object):
         if getresponse and payload:
             async with self._send_lock:
                 async with self._recv_lock:
-                    await self._defer_callbacks(pause=True)
                     result = await self._send_receive_locked( payload=payload, getresponse=getresponse, decode_response=decode_response, from_child=from_child, timeout=timeout, retry=retry )
         elif getresponse:
             async with self._recv_lock:
-                await self._defer_callbacks(pause=True)
                 result = await self._send_receive_locked( payload=payload, getresponse=getresponse, decode_response=decode_response, from_child=from_child, timeout=timeout, retry=retry )
         else:
             async with self._send_lock:
-                await self._defer_callbacks(pause=True)
                 result = await self._send_receive_locked( payload=payload, getresponse=getresponse, decode_response=decode_response, from_child=from_child, timeout=timeout, retry=retry )
-        await self._defer_callbacks(delay=False)
         return result
 
     async def _send_receive_locked( self, payload=None, getresponse=True, decode_response=True, from_child=None, timeout=True, retry=True ):
@@ -495,10 +438,6 @@ class DeviceAsync(object):
                         msg = rmsg
                         self.raw_recv.append(rmsg)
                         self._get_retcode(self.raw_sent, rmsg) # set self.cmd_retcode
-                        if len(msg.payload) == 0:
-                            for cb in self._callbacks_response:
-                                self._deferred_callbacks.append( cb( self, None, msg ) )
-                            await self._defer_callbacks(delay=False)
                     if (not msg or len(msg.payload) == 0) and recv_retries <= max_recv_retries:
                         log.debug("received null payload (%r), fetch new one - retry %s / %s", msg, recv_retries, max_recv_retries)
                         recv_retries += 1
@@ -647,15 +586,10 @@ class DeviceAsync(object):
                     # otherwise, trash it
                     if found_child:
                         found_child._handle_response(result, msg)
-                        for cb in found_child._callbacks_response:
-                            self._deferred_callbacks.append( cb( found_child, result, msg ) )
                         result = found_child._process_response(result)
                     else:
                         self._handle_response(result, msg)
-                        for cb in self._callbacks_response:
-                            self._deferred_callbacks.append( cb( self, result, msg ) )
                         result = self._process_response(result)
-                    await self._defer_callbacks()
                     self.received_wrong_cid_queue.append( (found_child, result) )
                 # events should not be coming in so fast that we will never timeout a read, so don't worry about loops
                 return await self._send_receive_locked( None, True, decode_response, from_child=from_child, timeout=timeout, retry=retry)
@@ -665,9 +599,6 @@ class DeviceAsync(object):
 
         obj = self if not found_child else found_child
         obj._handle_response(result, msg)
-        for cb in obj._callbacks_response:
-            self._deferred_callbacks.append( cb( obj, result, msg ) )
-        await self._defer_callbacks(delay=False)
         return obj._process_response(result)
 
     def _decrypt_payload(self, payload):
@@ -1029,7 +960,6 @@ class DeviceAsync(object):
         return self._set_version(version)
 
     def _set_version(self, version):
-        # FIXME rework the await self.detect_available_dps() below
         version = float(version)
         self.version = version
         self.version_str = "v" + str(version)
@@ -1039,8 +969,8 @@ class DeviceAsync(object):
         if version == 3.2: # 3.2 behaves like 3.3 with device22
             self.dev_type="device22"
             if self.dps_to_request == {}:
-                # FIXME cannot await here
-                self.detect_available_dps()
+                loop = asyncio.get_running_loop()
+                asyncio.run_coroutine_threadsafe(self.detect_available_dps(), loop)
 
     def set_socketPersistent(self, persist):
         self.socketPersistent = persist
@@ -1075,9 +1005,7 @@ class DeviceAsync(object):
         self.sendWait = s
 
     async def open(self):
-        await self._defer_callbacks(pause=True)
         result = await self._ensure_connection()
-        await self._defer_callbacks(delay=False)
         return result
 
     async def close(self, reason=None):
@@ -1086,15 +1014,11 @@ class DeviceAsync(object):
     async def _close(self, reason=None):
         self.connected.clear()
         if self.writer:
-            await self._defer_callbacks(pause=True)
             try:
                 self.writer.close()
                 await self.writer.wait_closed()
             except Exception as e:
                 log.debug(f"Error closing writer: {e}")
-            for cb in self._callbacks_disconnect:
-                self._deferred_callbacks.append( cb( self, reason ) )
-            await self._defer_callbacks(delay=False)
         self.writer = None
         self.reader = None
         self.cache_clear()
@@ -1109,7 +1033,7 @@ class DeviceAsync(object):
             self._close_task.cancel()
             await self._close_task
             self._close_task = None
-        print('closing socket in 100ms')
+        log.debug('closing socket in 100ms')
         self._close_task = asyncio.create_task( self._run_close() )
 
     async def _run_close(self):
@@ -1264,18 +1188,6 @@ class DeviceAsync(object):
         return MessagePayload(command_override, payload)
 
 
-    def register_connect_handler( self, cb ):
-        if cb not in self._callbacks_connect:
-            self._callbacks_connect.append( cb )
-
-    def register_disconnect_handler( self, cb ):
-        if cb not in self._callbacks_disconnect:
-            self._callbacks_disconnect.append( cb )
-
-    def register_response_handler( self, cb ):
-        if cb not in self._callbacks_response:
-            self._callbacks_response.append( cb )
-
     #
     # The following methods are taken from the v1 Device class and modified to be async-compatible.
     #
@@ -1321,46 +1233,6 @@ class DeviceAsync(object):
         data = await self._send_receive(payload, getresponse=False)
         log.debug("heartbeat received data=%r", data)
         return data
-
-    async def heartbeat_task(self, auto_open=False):
-        return await self._run_task(self._heartbeat_task_action, auto_open=auto_open)
-
-    async def _heartbeat_task_action(self):
-        await asyncio.sleep(9)
-        if self.connected.is_set():
-            await self.heartbeat()
-
-    async def receive_task(self, auto_open=False):
-        return await self._run_task(self._receive_task_action, auto_open=auto_open)
-
-    async def _receive_task_action(self):
-        msg = await self._send_receive(None, getresponse=True, timeout=None, retry=False)
-
-    async def _run_task(self, task, auto_open=False):
-        if auto_open:
-            self.socketPersistent = True
-
-        try:
-            while True:
-                if not self.connected.is_set():
-                    if auto_open:
-                        async with self._recv_lock:
-                            async with self._send_lock:
-                                if await self._ensure_connection():
-                                    # error connecting!
-                                    await asyncio.sleep(2)
-                                    continue
-                    else:
-                        try:
-                            await self.connected.wait()
-                        except Exception as e:
-                            print('got conn wait exception:', e)
-                        continue
-
-                await task()
-        except asyncio.CancelledError as e:
-            print('got cancelled exception:', e)
-            pass
 
     async def updatedps(self, index=None):
         """
